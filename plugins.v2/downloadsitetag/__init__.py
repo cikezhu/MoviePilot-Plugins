@@ -242,16 +242,41 @@ class DownloadSiteTag(_PluginBase):
         except ValueError:
             return i
     
+    # @staticmethod
+    # def custom_intersection(indexers, tags):
+    #     """
+    #     自定义交集算法, 用于处理标签与分类的交集(后缀匹配模式)
+    #     """
+    #     return {
+    #         idx for idx in set(indexers) 
+    #         for tag in set(tags) 
+    #         if idx == tag or tag.endswith(idx)
+    #     }
+
     @staticmethod
-    def custom_intersection(indexers, tags):
+    def _get_tags_to_remove_for_prefix(base_name: str, prefix: str, existing_tags: list) -> list:
         """
-        自定义交集算法, 用于处理标签与分类的交集(后缀匹配模式)
+        根据前缀策略，识别需要移除的旧标签
         """
-        return {
-            idx for idx in set(indexers) 
-            for tag in set(tags) 
-            if idx == tag or tag.endswith(idx)
-        }
+        to_remove = []
+        if not base_name or not existing_tags:
+            return to_remove
+
+        if prefix:
+            # 清理无前缀的标签
+            if base_name in existing_tags:
+                to_remove.append(base_name)
+            # 清理带旧前缀的标签
+            current_prefixed_tag = f"{prefix}{base_name}"
+            for tag in existing_tags:
+                if tag.endswith(base_name) and tag != current_prefixed_tag:
+                    to_remove.append(tag)
+        else:
+            # 清理所有带前缀的标签
+            for tag in existing_tags:
+                if tag.endswith(base_name) and tag != base_name:
+                    to_remove.append(tag)
+        return to_remove
 
     def _complemented_history(self):
         """
@@ -263,7 +288,7 @@ class DownloadSiteTag(_PluginBase):
         # 记录处理的种子, 供辅种(无下载历史)使用
         dispose_history = {}
         # 所有站点索引
-        indexers = [self._generate_site_tag(i.get("name")) if self._site_prefix else i.get("name") for i in SitesHelper().get_indexers()]
+        indexers = [self._generate_site_tag(i.get("name")) for i in SitesHelper().get_indexers()]
         # JackettIndexers索引器支持多个站点, 如果不存在历史记录, 则通过tracker会再次附加其他站点名称
         indexers.append(self._generate_site_tag("JackettIndexers"))
         indexers = set(indexers)
@@ -367,39 +392,15 @@ class DownloadSiteTag(_PluginBase):
                     if torrent_tags:
                         # 站点标签处理
                         if history.torrent_site:
-                            # 如果配置了站点前缀
-                            if self._site_prefix:
-                                # 清理无前缀的站点标签
-                                if history.torrent_site in torrent_tags:
-                                    tags_to_remove.append(history.torrent_site)
-                                # 清理带旧前缀的站点标签（除了当前前缀）
-                                for tag in torrent_tags:
-                                    if tag.endswith(history.torrent_site) and tag != f"{self._site_prefix}{history.torrent_site}":
-                                        tags_to_remove.append(tag)
-                            # 如果没有配置站点前缀
-                            else:
-                                # 清理所有带前缀的站点标签
-                                for tag in torrent_tags:
-                                    if tag.endswith(history.torrent_site) and tag != history.torrent_site:
-                                        tags_to_remove.append(tag)
+                            tags_to_remove.extend(
+                                self._get_tags_to_remove_for_prefix(history.torrent_site, self._site_prefix, torrent_tags)
+                            )
                         
                         # 剧名标签处理
                         if history.title:
-                            # 如果配置了剧名前缀
-                            if self._media_prefix:
-                                # 清理无前缀的剧名标签
-                                if history.title in torrent_tags:
-                                    tags_to_remove.append(history.title)
-                                # 清理带旧前缀的剧名标签（除了当前前缀）
-                                for tag in torrent_tags:
-                                    if tag.endswith(history.title) and tag != f"{self._media_prefix}{history.title}":
-                                        tags_to_remove.append(tag)
-                            # 如果没有配置剧名前缀
-                            else:
-                                # 清理所有带前缀的剧名标签
-                                for tag in torrent_tags:
-                                    if tag.endswith(history.title) and tag != history.title:
-                                        tags_to_remove.append(tag)
+                            tags_to_remove.extend(
+                                self._get_tags_to_remove_for_prefix(history.title, self._media_prefix, torrent_tags)
+                            )
                     
                     # 去除种子已经存在的标签
                     if _tags and torrent_tags:
@@ -426,27 +427,27 @@ class DownloadSiteTag(_PluginBase):
 
         logger.info(f"{self.LOG_TAG}执行完成")
 
+    def _generate_prefixed_tag(self, name: str, prefix: str) -> str:
+        """
+        生成带前缀的标签
+        """
+        if not name:
+            return ""
+        if prefix:
+            return f"{prefix}{name}"
+        return name
+
     def _generate_site_tag(self, site_name):
         """
         生成带前缀的站点标签
         """
-        if not site_name:
-            return ""
-        if self._site_prefix:
-            return f"{self._site_prefix}{site_name}"
-        else:
-            return site_name
+        return self._generate_prefixed_tag(site_name, self._site_prefix)
     
     def _generate_media_tag(self, media_title):
         """
         生成带前缀的剧名标签
         """
-        if not media_title:
-            return ""
-        if self._media_prefix:
-            return f"{self._media_prefix}{media_title}"
-        else:
-            return media_title
+        return self._generate_prefixed_tag(media_title, self._media_prefix)
 
     def _genre_ids_get_cat(self, mtype, genre_ids=None):
         """
@@ -732,7 +733,7 @@ class DownloadSiteTag(_PluginBase):
                 torrents, error = downloader_obj.get_torrents()
                 # 如果下载器获取种子发生错误 或 没有种子 则跳过
                 if error or not torrents:
-                    logger.warn(
+                    logger.error(
                         f"{self.LOG_TAG}删除所有未被任何种子使用的标签时发生了错误或查询不到任何种子!")
                     return
             logger.info(
@@ -748,8 +749,8 @@ class DownloadSiteTag(_PluginBase):
             # 删除未使用的标签
             if unused_tags:
                 downloader_obj.delete_torrents_tag(ids=None, tag=unused_tags)
-                logger.info(
-                    f"{self.LOG_TAG}删除所有未被任何种子使用的标签: {",".join(unused_tags)}")
+                logger.warn(
+                    f"{self.LOG_TAG}删除所有未被任何种子使用的标签: {','.join(unused_tags)}")
         except Exception as e:
             logger.error(
                 f"{self.LOG_TAG}删除所有未被任何种子使用的标签时发生了错误: {str(e)}")
