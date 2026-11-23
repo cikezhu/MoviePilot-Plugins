@@ -28,7 +28,7 @@ class DownloadSiteTag(_PluginBase):
     # 插件图标
     plugin_icon = "Youtube-dl_B.png"
     # 插件版本
-    plugin_version = "2.7"
+    plugin_version = "2.8"
     # 插件作者
     plugin_author = "叮叮当"
     # 作者主页
@@ -70,6 +70,8 @@ class DownloadSiteTag(_PluginBase):
     ])
     _tracker_mappings_str = ""
     _tracker_mappings = {}
+    # 是否使用内置默认tracker映射；关闭后清空文本框即可彻底禁用映射
+    _use_default_mappings = True
     _del_tags_task_rid = {}
     # 前缀配置
     _site_prefix = ""
@@ -96,20 +98,22 @@ class DownloadSiteTag(_PluginBase):
             self._category_tv = config.get("category_tv") or "电视"
             self._category_anime = config.get("category_anime") or "动漫"
             self._downloaders = config.get("downloaders")
+            self._use_default_mappings = config.get("use_default_mappings", True) is not False
             self._tracker_mappings_str = config.get("tracker_mappings_str", "")
             # 读取前缀配置
             self._site_prefix = config.get("site_prefix", "")
             self._media_prefix = config.get("media_prefix", "")
 
-            # 此设置对于老用户来说缺乏具体说明，因此如果为空，表示用户首次更新，则使用默认配置起到提示作用
-            if not ("tracker_mappings_str" in config):
+            # 此设置对于老用户来说缺乏具体说明，因此如果缺少该键，表示用户首次更新，写入默认配置起到提示作用
+            if "tracker_mappings_str" not in config:
                 config["tracker_mappings_str"] = self._tracker_mappings_default
                 self.update_config(config)
-            # 如果用户有配置，解析并合并到默认映射中
-            elif self._tracker_mappings_str:
-                user_mappings = self._parse_tracker_mappings(self._tracker_mappings_str)
-                # 将用户映射合并到默认映射中，用户映射会覆盖默认映射中相同的key
-                self._tracker_mappings.update(user_mappings)
+            # 用户关闭默认映射时，只保留自己的规则（清空文本框即可彻底禁用映射）
+            if not self._use_default_mappings:
+                self._tracker_mappings = {}
+            # 用户有配置时解析并合并，用户规则覆盖默认规则中相同的 key
+            if self._tracker_mappings_str:
+                self._tracker_mappings.update(self._parse_tracker_mappings(self._tracker_mappings_str))
             
             # 首次运行时，从下载器初始化rid映射
             if self._enabled_del_tags:
@@ -184,60 +188,64 @@ class DownloadSiteTag(_PluginBase):
             "kwargs": {} # 定时器参数
         }]
         """
-        # 初始化公共服务列表
         tasks = []
-        if self._enabled:
-            if self._enabled_del_tags:
-                # 添加 删除所有未被任何种子使用的标签 任务 每5分钟执行一次
-                tasks.append({
-                    "id": "DeleteUnusedTags",
-                    "name": "删除下载器中未被使用的标签",
-                    "trigger": "interval",
-                    "func": self._task_del_unused_tags,
-                    "kwargs": {
-                        "minutes": 5
-                    }
-                })
-            if self._interval == "计划任务" or self._interval == "固定间隔":
-                if self._interval == "固定间隔":
-                    if self._interval_unit == "小时":
-                        return [{
-                            "id": "DownloadSiteTag",
-                            "name": "补全下载历史的标签与分类",
-                            "trigger": "interval",
-                            "func": self._complemented_history,
-                            "kwargs": {
-                                "hours": self._interval_time
-                            }
-                        }]
-                    else:
-                        if self._interval_time < 5:
-                            self._interval_time = 5
-                            logger.info(f"启动定时服务: 最小不少于5分钟, 防止执行间隔太短任务冲突")
-                        tasks.append({
-                            "id": "DownloadSiteTag",
-                            "name": "补全下载历史的标签与分类",
-                            "trigger": "interval",
-                            "func": self._complemented_history,
-                            "kwargs": {
-                                "minutes": self._interval_time
-                            }
-                        })
-                else:
-                    tasks.append({
-                        "id": "DownloadSiteTag",
-                        "name": "补全下载历史的标签与分类",
-                        "trigger": CronTrigger.from_crontab(self._interval_cron),
-                        "func": self._complemented_history,
-                        "kwargs": {}
-                    })
+        if not self._enabled:
+            return tasks
+
+        # 删除未使用标签任务独立于补全任务的定时方式注册
+        if self._enabled_del_tags:
+            tasks.append({
+                "id": "DeleteUnusedTags",
+                "name": "删除下载器中未被使用的标签",
+                "trigger": "interval",
+                "func": self._task_del_unused_tags,
+                "kwargs": {
+                    "minutes": 5
+                }
+            })
+
+        if self._interval == "计划任务":
+            try:
+                trigger = CronTrigger.from_crontab(self._interval_cron)
+            except Exception as e:
+                # cron 非法时只跳过补全任务，不影响其他已注册服务
+                logger.error(f"计划任务 cron 表达式无效（{self._interval_cron}），已跳过补全任务：{str(e)}")
+                return tasks
+            tasks.append({
+                "id": "DownloadSiteTag",
+                "name": "补全下载历史的标签与分类",
+                "trigger": trigger,
+                "func": self._complemented_history,
+                "kwargs": {}
+            })
+        elif self._interval == "固定间隔":
+            interval_time = self.str_to_number(self._interval_time, 6)
+            if self._interval_unit == "小时":
+                # 小时间隔同样需要正数校验，避免非法间隔导致插件全部服务注册失败
+                if interval_time <= 0:
+                    interval_time = 1
+                    logger.info("启动定时服务: 小时间隔必须大于0，已重置为1小时")
+                kwargs = {"hours": interval_time}
+            else:
+                if interval_time < 5:
+                    interval_time = 5
+                    logger.info("启动定时服务: 最小不少于5分钟, 防止执行间隔太短任务冲突")
+                kwargs = {"minutes": interval_time}
+            tasks.append({
+                "id": "DownloadSiteTag",
+                "name": "补全下载历史的标签与分类",
+                "trigger": "interval",
+                "func": self._complemented_history,
+                "kwargs": kwargs
+            })
+
         return tasks
 
     @staticmethod
-    def str_to_number(s: str, i: int) -> int:
+    def str_to_number(s: Any, i: int) -> int:
         try:
             return int(s)
-        except ValueError:
+        except (ValueError, TypeError):
             return i
     
     # @staticmethod
@@ -252,45 +260,112 @@ class DownloadSiteTag(_PluginBase):
     #     }
 
     @staticmethod
-    def _get_tags_to_remove_for_prefix(base_name: str, prefix: str, existing_tags: list) -> list:
+    def _get_tags_to_remove_for_prefix(base_name: str, prefix: str, existing_tags: list,
+                                       protected_names: list = None) -> list:
         """
-        根据前缀策略，识别需要移除的旧标签
+        根据前缀策略，识别需要移除的旧标签。
+
+        只移除能够明确归属于 base_name 的标签：
+          - 无前缀标签 base_name（当前配置了前缀时才算旧标签）
+          - 带任意旧前缀的标签 P + base_name（当前前缀对应的标签保留）
+
+        为避免误删，采用"最长实体名优先"：若标签同时能匹配另一个更长的已知实体名
+        （如 ptchdbits.co 包含 chdbits.co），则认定它属于那个实体并保留。
         """
         to_remove = []
         if not base_name or not existing_tags:
             return to_remove
 
-        if prefix:
-            # 清理无前缀的标签
-            if base_name in existing_tags:
-                to_remove.append(base_name)
-            # 清理带旧前缀的标签
-            current_prefixed_tag = f"{prefix}{base_name}"
-            for tag in existing_tags:
-                if tag.endswith(base_name) and tag != current_prefixed_tag:
+        current_tag = f"{prefix}{base_name}" if prefix else base_name
+        base_len = len(base_name)
+        protected = [name for name in (protected_names or [])
+                     if name and name != base_name and len(name) > base_len]
+
+        for tag in existing_tags:
+            if not tag or tag == current_tag:
+                continue
+            if tag == base_name:
+                # 只有当前配置了前缀时，无前缀版本才算旧标签
+                if prefix:
                     to_remove.append(tag)
-        else:
-            # 清理所有带前缀的标签
-            for tag in existing_tags:
-                if tag.endswith(base_name) and tag != base_name:
-                    to_remove.append(tag)
+                continue
+            if not tag.endswith(base_name):
+                continue
+            # 能匹配更长的实体名，说明该标签属于其他实体，保留
+            if any(tag.endswith(name) for name in protected):
+                continue
+            # tag 去掉 base_name 后的剩余部分即为旧前缀
+            to_remove.append(tag)
         return to_remove
+
+    def _build_tag_changes(self, *, site_name: str = None, title: str = None,
+                           mtype: Any = None, tmdbid: Any = None, genre_ids: list = None,
+                           torrent_tags: list = None, torrent_cat: str = None,
+                           dl_type: str = None, protected_names: list = None) -> Tuple[list, Optional[str], list]:
+        """
+        统一计算需要新增的标签、分类以及需要清理的旧标签。
+
+        定时补全与下载事件共用本方法，保证两条路径行为一致。
+        """
+        torrent_tags = torrent_tags or []
+        _tags = []
+        if self._enabled_tag and site_name:
+            _tags.append(self._generate_site_tag(site_name))
+        if self._enabled_media_tag and title:
+            _tags.append(self._generate_media_tag(title))
+
+        # 分类：仅 qBittorrent 支持，且只有电影/电视剧参与分类
+        _cat = None
+        if dl_type == "qbittorrent" and self._enabled_category and not torrent_cat and mtype:
+            media_type = mtype
+            if isinstance(mtype, str):
+                try:
+                    media_type = MediaType(mtype)
+                except ValueError:
+                    media_type = None
+            if media_type in (MediaType.MOVIE, MediaType.TV):
+                if media_type == MediaType.TV and tmdbid and not genre_ids:
+                    tmdb_info = self.chain.tmdb_info(mtype=media_type, tmdbid=tmdbid)
+                    genre_ids = tmdb_info.get("genre_ids") if tmdb_info else None
+                _cat = self._genre_ids_get_cat(media_type, genre_ids)
+
+        # 旧前缀标签清理：把所有已知站点名作为保护名，避免误删其他站点/剧名的标签
+        tags_to_remove = []
+        if torrent_tags:
+            protected = list(protected_names or [])
+            if site_name:
+                protected.append(site_name)
+            if title:
+                protected.append(title)
+            if self._enabled_tag and site_name:
+                tags_to_remove.extend(
+                    self._get_tags_to_remove_for_prefix(site_name, self._site_prefix, torrent_tags, protected))
+            if self._enabled_media_tag and title:
+                tags_to_remove.extend(
+                    self._get_tags_to_remove_for_prefix(title, self._media_prefix, torrent_tags, protected))
+
+        # 去除种子上已经存在的标签
+        if _tags and torrent_tags:
+            _tags = list(set(_tags) - set(torrent_tags))
+
+        return _tags, _cat, tags_to_remove
 
     def _complemented_history(self):
         """
         补全下载历史的标签与分类，且执行清理未使用的标签
         """
-        if not self.service_infos:
+        service_infos = self.service_infos
+        if not service_infos:
             return
         logger.info(f"开始执行 ...")
         # 记录处理的种子, 供辅种(无下载历史)使用
         dispose_history = {}
-        # 所有站点索引
-        indexers = [self._generate_site_tag(i.get("name")) for i in SitesHelper().get_indexers()]
+        # 所有已知站点名（同时用于标签清理时的归属保护）
+        site_names = [i.get("name") for i in SitesHelper().get_indexers() if i.get("name")]
         # JackettIndexers索引器支持多个站点, 如果不存在历史记录, 则通过tracker会再次附加其他站点名称
-        indexers.append(self._generate_site_tag("JackettIndexers"))
-        indexers = set(indexers)
-        for service in self.service_infos.values():
+        site_names.append("JackettIndexers")
+        indexers = {self._generate_site_tag(name) for name in site_names}
+        for service in service_infos.values():
             downloader = service.name
             downloader_obj = service.instance
             logger.info(f"开始扫描下载器 {downloader} ...")
@@ -344,9 +419,9 @@ class DownloadSiteTag(_PluginBase):
                     elif not history.torrent_site:
                         trackers = self._get_trackers(torrent=torrent, dl_type=service.type)
                         for tracker in trackers:
-                            # 检查tracker是否包含特定的关键字，并进行相应的映射
+                            # 按域名边界匹配映射规则，避免子串误命中
                             for key, mapped_domain in self._tracker_mappings.items():
-                                if key in tracker:
+                                if self._tracker_matches(tracker, key):
                                     domain = mapped_domain
                                     break
                             else:
@@ -358,56 +433,18 @@ class DownloadSiteTag(_PluginBase):
                         # 如果通过tracker还是无法获取站点名称, 且tmdbid, type, title都是空的, 那么跳过当前种子
                         if not history.torrent_site and not history.tmdbid and not history.type and not history.title:
                             continue
-                    # 按设置生成需要写入的标签与分类
-                    _tags = []
-                    _cat = None
-                    
-                    # 站点标签, 如果勾选开关的话 因允许torrent_site为空时运行到此, 因此需要判断torrent_site不为空
-                    if self._enabled_tag and history.torrent_site:
-                        site_tag = self._generate_site_tag(history.torrent_site)
-                        _tags.append(site_tag)
-                    
-                    # 媒体标题标签, 如果勾选开关的话 因允许title为空时运行到此, 因此需要判断title不为空
-                    if self._enabled_media_tag and history.title:
-                        media_tag = self._generate_media_tag(history.title)
-                        _tags.append(media_tag)
-                    
-                    # 分类, 如果勾选开关的话 <tr暂不支持> 因允许mtype为空时运行到此, 因此需要判断mtype不为空。为防止不必要的识别, 种子已经存在分类torrent_cat时 也不执行
-                    if service.type == "qbittorrent" and self._enabled_category and not torrent_cat and history.type:
-                        # 如果是电视剧 需要区分是否动漫
-                        genre_ids = None
-                        # 因允许tmdbid为空时运行到此, 因此需要判断tmdbid不为空
-                        history_type = MediaType(history.type) if history.type else None
-                        if history.tmdbid and history_type == MediaType.TV:
-                            # tmdb_id获取tmdb信息
-                            tmdb_info = self.chain.tmdb_info(mtype=history_type, tmdbid=history.tmdbid)
-                            if tmdb_info:
-                                genre_ids = tmdb_info.get("genre_ids")
-                        _cat = self._genre_ids_get_cat(history.type, genre_ids)
+                    # 统一计算标签、分类与需要清理的旧标签（与下载事件共用同一逻辑）
+                    _tags, _cat, tags_to_remove = self._build_tag_changes(
+                        site_name=history.torrent_site,
+                        title=history.title,
+                        mtype=history.type,
+                        tmdbid=history.tmdbid,
+                        torrent_tags=torrent_tags,
+                        torrent_cat=torrent_cat,
+                        dl_type=service.type,
+                        protected_names=site_names,
+                    )
 
-                    # 识别并清理历史标签
-                    tags_to_remove = []
-                    if torrent_tags:
-                        # 站点标签处理
-                        if history.torrent_site:
-                            tags_to_remove.extend(
-                                self._get_tags_to_remove_for_prefix(history.torrent_site, self._site_prefix, torrent_tags)
-                            )
-                        
-                        # 剧名标签处理
-                        if history.title:
-                            tags_to_remove.extend(
-                                self._get_tags_to_remove_for_prefix(history.title, self._media_prefix, torrent_tags)
-                            )
-                    
-                    # 去除种子已经存在的标签
-                    if _tags and torrent_tags:
-                        _tags = list(set(_tags) - set(torrent_tags))
-                    
-                    # 如果分类一样, 那么不需要修改
-                    if _cat == torrent_cat:
-                        _cat = None
-                    
                     # 判断当前种子是否不需要修改
                     if not _cat and not _tags and not tags_to_remove:
                         continue
@@ -449,22 +486,17 @@ class DownloadSiteTag(_PluginBase):
 
     def _genre_ids_get_cat(self, mtype, genre_ids=None):
         """
-        根据genre_ids判断是否<动漫>分类
+        根据genre_ids判断是否<动漫>分类；仅电影/电视剧参与分类
         """
-        _cat = None
         if mtype == MediaType.MOVIE or mtype == MediaType.MOVIE.value:
-            # 电影
-            _cat = self._category_movie
-        elif mtype:
-            ANIME_GENREIDS = settings.ANIME_GENREIDS
-            if genre_ids \
-                    and set(genre_ids).intersection(set(ANIME_GENREIDS)):
-                # 动漫
-                _cat = self._category_anime
-            else:
-                # 电视剧
-                _cat = self._category_tv
-        return _cat
+            return self._category_movie
+        if mtype == MediaType.TV or mtype == MediaType.TV.value:
+            anime_genreids = set(settings.ANIME_GENREIDS or [])
+            if genre_ids and anime_genreids.intersection(set(genre_ids)):
+                return self._category_anime
+            return self._category_tv
+        # 未知/系列等非电影非电视剧类型不设置分类
+        return None
 
     @staticmethod
     def _parse_tracker_mappings(mapping_str: str) -> dict:
@@ -506,6 +538,35 @@ class DownloadSiteTag(_PluginBase):
                     tracker_mappings[parts[0].strip()] = parts[1].strip()
                     
         return tracker_mappings
+
+    @staticmethod
+    def _tracker_host(value: str) -> str:
+        """
+        从 URL 或域名字符串中提取主机名（小写、去端口与路径），用于域名边界匹配
+        """
+        if not value:
+            return ""
+        host = str(value).strip()
+        if "://" in host:
+            host = host.split("://", 1)[1]
+        host = host.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+        if "@" in host:
+            host = host.rsplit("@", 1)[1]
+        if host.count(":") == 1:
+            host = host.split(":", 1)[0]
+        return host.lower().rstrip(".")
+
+    @classmethod
+    def _tracker_matches(cls, tracker: str, rule_key: str) -> bool:
+        """
+        判断 tracker 是否命中映射规则：按域名精确或子域匹配，
+        避免子串误命中（如 notfoo.com 不应命中 foo.com）
+        """
+        tracker_host = cls._tracker_host(tracker)
+        rule_host = cls._tracker_host(rule_key)
+        if not tracker_host or not rule_host:
+            return False
+        return tracker_host == rule_host or tracker_host.endswith("." + rule_host)
 
     @staticmethod
     def _torrent_key(torrent: Any, dl_type: str) -> Optional[Tuple[int, str]]:
@@ -675,9 +736,10 @@ class DownloadSiteTag(_PluginBase):
         """
         公共服务：删除所有未被任何种子使用的标签，遍历全部下载器
         """
-        if not self.service_infos:
+        service_infos = self.service_infos
+        if not service_infos:
             return
-        for service in self.service_infos.values():
+        for service in service_infos.values():
             # 仅qb支持删除未使用标签
             if service.type != "qbittorrent":
                 continue
@@ -759,10 +821,7 @@ class DownloadSiteTag(_PluginBase):
         """
         添加下载事件
         """
-        if not self.get_state():
-            return
-
-        if not event.event_data:
+        if not self.get_state() or not event.event_data:
             return
 
         try:
@@ -771,31 +830,48 @@ class DownloadSiteTag(_PluginBase):
                 logger.info("触发添加下载事件，但没有获取到下载器信息，跳过后续处理")
                 return
 
-            service = self.service_infos.get(downloader)
-            if not service:
+            service_infos = self.service_infos
+            if not service_infos:
+                return
+            service = service_infos.get(downloader)
+            if not service or not service.instance:
                 logger.info(f"触发添加下载事件，但没有监听下载器 {downloader}，跳过后续处理")
                 return
-            
-            context: Context = event.event_data.get("context")
+
             _hash = event.event_data.get("hash")
+            context: Context = event.event_data.get("context")
+            if not _hash or not context or not context.torrent_info or not context.media_info:
+                logger.info("触发添加下载事件，但缺少种子/媒体信息，跳过后续处理")
+                return
             _torrent = context.torrent_info
             _media = context.media_info
-            _tags = []
-            _cat = None
-            # 站点标签, 如果勾选开关的话
-            if self._enabled_tag and _torrent.site_name:
-                site_tag = self._generate_site_tag(_torrent.site_name)
-                _tags.append(site_tag)
-            # 媒体标题标签, 如果勾选开关的话
-            if self._enabled_media_tag and _media.title:
-                media_tag = self._generate_media_tag(_media.title)
-                _tags.append(media_tag)
-            # 分类, 如果勾选开关的话 <tr暂不支持>
-            if self._enabled_category and _media.type:
-                _cat = self._genre_ids_get_cat(_media.type, _media.genre_ids)
-            if _hash and (_tags or _cat):
+
+            # 取当前种子状态，用于识别已有标签/分类，与定时补全保持同一套逻辑
+            _torrent_obj = None
+            torrent_tags = []
+            torrent_cat = None
+            _torrents, error = service.instance.get_torrents(ids=_hash)
+            if not error and _torrents:
+                _torrent_obj = _torrents[0]
+                torrent_tags = self._get_label(torrent=_torrent_obj, dl_type=service.type)
+                torrent_cat = self._get_category(torrent=_torrent_obj, dl_type=service.type)
+
+            site_names = [i.get("name") for i in SitesHelper().get_indexers() if i.get("name")]
+            _tags, _cat, tags_to_remove = self._build_tag_changes(
+                site_name=_torrent.site_name,
+                title=_media.title,
+                mtype=_media.type,
+                genre_ids=_media.genre_ids,
+                torrent_tags=torrent_tags,
+                torrent_cat=torrent_cat,
+                dl_type=service.type,
+                protected_names=site_names,
+            )
+
+            if _tags or _cat or tags_to_remove:
                 # 执行通用方法, 设置种子标签与分类
-                self._set_torrent_info(service=service, _hash=_hash, _tags=_tags, _cat=_cat)
+                self._set_torrent_info(service=service, _hash=_hash, _torrent=_torrent_obj,
+                                       _tags=_tags, _cat=_cat, _tags_to_remove=tags_to_remove)
         except Exception as e:
             logger.error(
                 f"分析添加下载事件时发生了错误: {str(e)}")
@@ -1177,6 +1253,26 @@ class DownloadSiteTag(_PluginBase):
                                 },
                                 'content': [
                                     {
+                                        'component': 'VCheckboxBtn',
+                                        'props': {
+                                            'model': 'use_default_mappings',
+                                            'label': '使用内置默认映射规则（关闭后清空文本框即可彻底禁用映射）'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12
+                                },
+                                'content': [
+                                    {
                                         'component': 'VTextarea',
                                         'props': {
                                             'model': 'tracker_mappings_str',
@@ -1206,6 +1302,7 @@ class DownloadSiteTag(_PluginBase):
             "interval_cron": "5 4 * * *",
             "interval_time": "6",
             "interval_unit": "小时",
+            "use_default_mappings": True,
             "tracker_mappings_str": self._tracker_mappings_default,  # 添加默认的映射规则字符串
             "site_prefix": "",
             "media_prefix": ""
