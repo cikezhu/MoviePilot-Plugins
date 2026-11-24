@@ -28,7 +28,7 @@ class DownloadSiteTag(_PluginBase):
     # 插件图标
     plugin_icon = "Youtube-dl_B.png"
     # 插件版本
-    plugin_version = "2.8"
+    plugin_version = "2.9"
     # 插件作者
     plugin_author = "叮叮当"
     # 作者主页
@@ -298,6 +298,75 @@ class DownloadSiteTag(_PluginBase):
             to_remove.append(tag)
         return to_remove
 
+    @staticmethod
+    def _history_tmdbid(history: Any) -> Optional[int]:
+        """
+        兼容 V2/V3 从下载历史中取 TMDB ID：
+        V2 直接使用 history.tmdbid；
+        V3 使用 media_source/media_id，仅当来源为 themoviedb 时才是 TMDB ID。
+        """
+        if not history:
+            return None
+        tmdbid = getattr(history, "tmdbid", None)
+        if not tmdbid:
+            media_source = getattr(history, "media_source", None)
+            media_id = getattr(history, "media_id", None)
+            # MediaSource(str, Enum)：既可能是枚举也可能是字符串
+            source = getattr(media_source, "value", media_source)
+            if source in ("themoviedb", "tmdb") and media_id:
+                tmdbid = media_id
+        if not tmdbid:
+            return None
+        try:
+            return int(tmdbid)
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _genre_ids_from_info(tmdb_info: Any) -> Optional[list]:
+        """
+        兼容 V2/V3 的 TMDB 信息结构：
+        V2 直接提供 genre_ids；V3 提供 genres 字典列表。
+        """
+        if not tmdb_info:
+            return None
+        if isinstance(tmdb_info, dict):
+            genre_ids = tmdb_info.get("genre_ids")
+            if genre_ids:
+                return list(genre_ids)
+            genres = tmdb_info.get("genres") or []
+            ids = [g.get("id") for g in genres
+                   if isinstance(g, dict) and g.get("id") is not None]
+            return ids or None
+        # V3 可能返回带属性的对象
+        genre_ids = getattr(tmdb_info, "genre_ids", None) or getattr(tmdb_info, "genres", None)
+        if not genre_ids:
+            return None
+        ids = [g.get("id") if isinstance(g, dict) else getattr(g, "id", None)
+               for g in genre_ids]
+        return [i for i in ids if i is not None] or None
+
+    def _query_genre_ids(self, mtype: Any, tmdbid: Any) -> Optional[list]:
+        """
+        兼容 V2/V3 查询 TMDB 类型 ID：
+        V2 通过 self.chain.tmdb_info；
+        V3 的 chain 兼容层可能没有该方法，降级到模块调度接口。
+        """
+        if not tmdbid:
+            return None
+        try:
+            info = self.chain.tmdb_info(mtype=mtype, tmdbid=tmdbid)
+        except (AttributeError, TypeError):
+            try:
+                info = self.chain.run_module("tmdb_info", mtype=mtype, tmdbid=tmdbid)
+            except Exception as e:
+                logger.debug(f"查询TMDB类型信息失败: {str(e)}")
+                return None
+        except Exception as e:
+            logger.debug(f"查询TMDB类型信息失败: {str(e)}")
+            return None
+        return self._genre_ids_from_info(info)
+
     def _build_tag_changes(self, *, site_name: str = None, title: str = None,
                            mtype: Any = None, tmdbid: Any = None, genre_ids: list = None,
                            torrent_tags: list = None, torrent_cat: str = None,
@@ -325,8 +394,7 @@ class DownloadSiteTag(_PluginBase):
                     media_type = None
             if media_type in (MediaType.MOVIE, MediaType.TV):
                 if media_type == MediaType.TV and tmdbid and not genre_ids:
-                    tmdb_info = self.chain.tmdb_info(mtype=media_type, tmdbid=tmdbid)
-                    genre_ids = tmdb_info.get("genre_ids") if tmdb_info else None
+                    genre_ids = self._query_genre_ids(media_type, tmdbid)
                 _cat = self._genre_ids_get_cat(media_type, genre_ids)
 
         # 旧前缀标签清理：把所有已知站点名作为保护名，避免误删其他站点/剧名的标签
@@ -412,6 +480,8 @@ class DownloadSiteTag(_PluginBase):
                         # 加入历史记录
                         if _key:
                             dispose_history[_key] = history
+                    # 兼容 V2/V3 读取下载历史中的 TMDB ID
+                    _history_tmdbid = self._history_tmdbid(history)
                     # 如果标签已经存在任意站点, 则不再添加站点标签
                     if indexers.intersection(set(torrent_tags)):
                         history.torrent_site = None
@@ -431,14 +501,14 @@ class DownloadSiteTag(_PluginBase):
                                 history.torrent_site = site_info.get("name")
                                 break
                         # 如果通过tracker还是无法获取站点名称, 且tmdbid, type, title都是空的, 那么跳过当前种子
-                        if not history.torrent_site and not history.tmdbid and not history.type and not history.title:
+                        if not history.torrent_site and not _history_tmdbid and not history.type and not history.title:
                             continue
                     # 统一计算标签、分类与需要清理的旧标签（与下载事件共用同一逻辑）
                     _tags, _cat, tags_to_remove = self._build_tag_changes(
                         site_name=history.torrent_site,
                         title=history.title,
                         mtype=history.type,
-                        tmdbid=history.tmdbid,
+                        tmdbid=_history_tmdbid,
                         torrent_tags=torrent_tags,
                         torrent_cat=torrent_cat,
                         dl_type=service.type,
@@ -491,7 +561,7 @@ class DownloadSiteTag(_PluginBase):
         if mtype == MediaType.MOVIE or mtype == MediaType.MOVIE.value:
             return self._category_movie
         if mtype == MediaType.TV or mtype == MediaType.TV.value:
-            anime_genreids = set(settings.ANIME_GENREIDS or [])
+            anime_genreids = set(getattr(settings, "ANIME_GENREIDS", None) or [16])
             if genre_ids and anime_genreids.intersection(set(genre_ids)):
                 return self._category_anime
             return self._category_tv
@@ -840,11 +910,11 @@ class DownloadSiteTag(_PluginBase):
 
             _hash = event.event_data.get("hash")
             context: Context = event.event_data.get("context")
-            if not _hash or not context or not context.torrent_info or not context.media_info:
+            _torrent = getattr(context, "torrent_info", None)
+            _media = getattr(context, "media_info", None)
+            if not _hash or not _torrent or not _media:
                 logger.info("触发添加下载事件，但缺少种子/媒体信息，跳过后续处理")
                 return
-            _torrent = context.torrent_info
-            _media = context.media_info
 
             # 取当前种子状态，用于识别已有标签/分类，与定时补全保持同一套逻辑
             _torrent_obj = None
@@ -858,10 +928,10 @@ class DownloadSiteTag(_PluginBase):
 
             site_names = [i.get("name") for i in SitesHelper().get_indexers() if i.get("name")]
             _tags, _cat, tags_to_remove = self._build_tag_changes(
-                site_name=_torrent.site_name,
-                title=_media.title,
-                mtype=_media.type,
-                genre_ids=_media.genre_ids,
+                site_name=getattr(_torrent, "site_name", None),
+                title=getattr(_media, "title", None),
+                mtype=getattr(_media, "type", None),
+                genre_ids=getattr(_media, "genre_ids", None),
                 torrent_tags=torrent_tags,
                 torrent_cat=torrent_cat,
                 dl_type=service.type,
